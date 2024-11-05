@@ -1,0 +1,96 @@
+name: Vaultwarden 镜像同步
+
+on:
+  workflow_dispatch:  # 手动触发
+  schedule:
+    - cron: '0 0 * * *'  # UTC 0点，即北京时间 8点
+
+jobs:
+  docker-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检查镜像更新
+        id: check
+        run: |
+          # 拉取源镜像
+          docker pull vaultwarden/server:latest
+          SOURCE_ID=$(docker inspect vaultwarden/server:latest --format='{{.Id}}')
+          echo "源镜像 ID: $SOURCE_ID"
+          
+          # 尝试拉取目标镜像
+          if docker pull ${{ secrets.DOCKER_HUB_USERNAME }}/${{ secrets.DOCKER_HUB_REPO }}:latest 2>/dev/null; then
+            TARGET_ID=$(docker inspect ${{ secrets.DOCKER_HUB_USERNAME }}/${{ secrets.DOCKER_HUB_REPO }}:latest --format='{{.Id}}')
+            echo "目标镜像 ID: $TARGET_ID"
+          else
+            TARGET_ID="none"
+            echo "目标镜像不存在"
+          fi
+          
+          if [ "$SOURCE_ID" != "$TARGET_ID" ]; then
+            echo "update_needed=true" >> $GITHUB_OUTPUT
+            echo "need_notify=true" >> $GITHUB_OUTPUT
+            echo "发现新版本，需要更新"
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+            echo "need_notify=true" >> $GITHUB_OUTPUT
+            echo "手动触发，镜像已是最新版本，仅发送通知"
+          else
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+            echo "need_notify=false" >> $GITHUB_OUTPUT
+            echo "已是最新版本，无需更新, 不发送通知"
+          fi
+
+      - name: 登录到 Docker Hub
+        if: steps.check.outputs.update_needed == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      # 只有在需要更新时才执行标记和推送
+      - name: 标记并推送镜像
+        if: steps.check.outputs.update_needed == 'true'
+        id: push
+        run: |
+          docker tag vaultwarden/server:latest ${{ secrets.DOCKER_HUB_USERNAME }}/${{ secrets.DOCKER_HUB_REPO }}:latest
+          docker push ${{ secrets.DOCKER_HUB_USERNAME }}/${{ secrets.DOCKER_HUB_REPO }}:latest
+          echo "pushed=true" >> $GITHUB_OUTPUT
+
+      - name: 获取当前时间
+        if: steps.check.outputs.need_notify == 'true'
+        id: time
+        run: |
+          export TZ='Asia/Shanghai'
+          echo "current_time=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+      # 根据不同情况发送不同的通知
+      - name: 发送通知
+        if: steps.check.outputs.need_notify == 'true'
+        uses: candies404/Multi-Channel-Notifier@latest
+        with:
+          wpush_key: ${{ secrets.WPUSH_KEY }}
+          hitokoto: 'false'
+          title: "vaultwarden Docker 镜像检查"
+          content: |
+            ${{ steps.check.outputs.update_needed == 'true' && '**✅ 镜像更新完成**' || '**ℹ️ 镜像已是最新**' }}
+            ---
+            **时间**: `${{ steps.time.outputs.current_time }}`
+            **Docker 仓库**: [Docker Hub](https://hub.docker.com/r/${{ secrets.DOCKER_HUB_USERNAME }}/${{ secrets
+            .DOCKER_HUB_REPO }})
+
+      # 发送错误通知 理论上不会失败
+      - name: 发送错误通知
+        if: failure()
+        uses: candies404/Multi-Channel-Notifier@latest
+        with:
+          wpush_key: ${{ secrets.WPUSH_KEY }}
+          hitokoto: 'false'
+          title: "⚠️ vaultwarden Docker 镜像同步失败"
+          content: |
+            content: |
+            **❌ 镜像更新失败**
+            ---
+            **时间**: `$(date '+%Y-%m-%d %H:%M:%S')`
+            **Docker 仓库**: [Docker Hub](https://hub.docker.com/r/${{ secrets.DOCKER_HUB_USERNAME }}/${{ secrets.DOCKER_HUB_REPO }})
+            **工作流程**: [${{ github.workflow }}](https://github.com/${{ github.repository }}/actions/workflows/${{ github.workflow }})
+            **运行记录**: [#${{ github.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
